@@ -304,14 +304,14 @@ class NERLongformer(pl.LightningModule):
 
         if mlm_labels is not None and masked_lm_loss!=None:
             #masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), mlm_labels.view(-1))
-            total_loss+=masked_lm_loss
+            total_loss+=0.4*masked_lm_loss
         if sbo_labels is not None and sbo_scores!=None:
             span_loss = loss_fct(sbo_scores.view(-1, self.config.vocab_size), sbo_labels.view(-1))
-            total_loss+=span_loss
+            total_loss+=0.1*span_loss
         if bio_labels is not None and bio_scores!=None:
             loss_fct.weight=self.class_weights
             bio_loss = loss_fct(bio_scores.view(-1, self.config.num_labels), bio_labels.view(-1))
-            total_loss+=bio_loss
+            total_loss+=0.6*bio_loss
 
         return (total_loss)
 
