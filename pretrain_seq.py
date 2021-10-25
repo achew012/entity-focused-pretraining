@@ -10,7 +10,7 @@ clearlogger = task.get_logger()
 config={
     "lr": 1e-4,
     "num_epochs":15,
-    "train_batch_size":4,
+    "train_batch_size":2,
     "eval_batch_size":1,
     "max_length": 2048, # be mindful underlength will cause device cuda side error
     "max_span_len": 15,
@@ -201,19 +201,9 @@ class NERLongformer(pl.LightningModule):
         self.tokenizer.model_max_length = self.args.max_length
 
         self.longformer = LongformerModel.from_pretrained('allenai/longformer-base-4096', config=self.config)
+        self.longformerMLM = LongformerForMaskedLM.from_pretrained('allenai/longformer-base-4096', config=self.config)
 
-        #self.longformerMLM = LongformerForMaskedLM.from_pretrained('allenai/longformer-base-4096', output_hidden_states=True)
-
-        self.lm_head = LongformerLMHead(self.config) 
-
-        # train_data = DWIE_Data(dwie["train"], self.tokenizer, self.class2id, self.args)
-        # y_train = torch.stack([doc["bio_labels"] for doc in train_data.consolidated_dataset]).view(-1).cpu().numpy()
-        # y_train = y_train[y_train != -100]
-        # self.class_weights=torch.cuda.FloatTensor(compute_class_weight("balanced", np.unique(y_train), y_train))
-        # #self.class_weights[0] = self.class_weights[0]/2
-        # self.class_weights = torch.cuda.FloatTensor([0.20, 1, 1.2, 1, 1.2])
-        # print("weights: {}".format(self.class_weights))
-
+        self.wte = self.longformerMLM.get_input_embeddings()
         self.sigmoid = nn.Sigmoid()
         self.classifier = nn.Sequential(
             nn.Linear(self.config.hidden_size*2, self.config.hidden_size),
@@ -275,6 +265,7 @@ class NERLongformer(pl.LightningModule):
             global_attention_mask=self._set_global_attention_mask(batch["input_ids"]), output_hidden_states=True
             )
 
+        # cls_output = outputs[0][:, 1]
         sequence_output = outputs[0][:, 1:] 
 
         ### Span CLF Objective
@@ -290,45 +281,53 @@ class NERLongformer(pl.LightningModule):
         extracted_spans_after_binary_mask = span_len_binary_mask_embeddings*span_embedding_groups #makes all padding positions into zero vectors (bs, num_samples, max_span_len, 768) 
         maxpooled_embeddings = torch.max(extracted_spans_after_binary_mask, dim=-2).values # (bs, num_samples, 768)
 
-        # if len(cls_output.repeat(sequence_output.size()[0], span_len_mask.size()[1], 1).size())!=len(maxpooled_embeddings.size()):
-        #     ipdb.set_trace()
-
         #combined_embeds = torch.cat([cls_output.unsqueeze(1).repeat(1, 40, 1), maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
-        combined_embeds = torch.cat([span_len_embeddings, maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
-        logits = self.classifier(combined_embeds).squeeze()        
+        combined_span_embeds = torch.cat([span_len_embeddings, maxpooled_embeddings], dim=-1) #(bs, num_samples, 2*768)
+        logits = self.classifier(combined_span_embeds).squeeze()        
 
         ### MLM Objective
-        ##############################################################################################################
-        # prediction_scores = self.lm_head(outputs[0])
+        ##############################################################################################################       
+        token_entity_embeds = torch.sum(torch.stack([self.wte(masked_input_ids), outputs[0]], dim=0), dim=0)
+
+        mlm_loss = None        
+        outputs = self.longformerMLM(
+            inputs_embeds = token_entity_embeds,
+            attention_mask = batch["attention_mask"],
+            global_attention_mask=self._set_global_attention_mask(batch["input_ids"]), 
+            labels = batch["input_ids"]
+        )
+        mlm_loss=outputs.loss
+
         ##############################################################################################################
 
-        masked_lm_loss = None        
         span_clf_loss = None
         if labels!=None:
             loss_fct = nn.BCELoss()
             span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
             total_loss+=span_clf_loss
 
-        # mlm_loss_fct = nn.CrossEntropyLoss()
-        # masked_lm_loss = mlm_loss_fct(prediction_scores.view(-1, self.config.vocab_size), batch["input_ids"].view(-1))
-        # total_loss+=masked_lm_loss
+        if mlm_loss!=None:
+            total_loss+=mlm_loss
 
-        return (total_loss, logits, span_clf_loss, masked_lm_loss)
+        return (total_loss, logits, span_clf_loss, mlm_loss)
 
     def training_step(self, batch, batch_idx):
         # training_step defines the train loop. It is independent of forward
         loss, _, span_clf_loss, masked_lm_loss = self(**batch)
         # logits = torch.argmax(self.softmax(logits), dim=-1)
-        return {"loss": loss}
+        return {"loss": loss, "mlm_loss": masked_lm_loss}
 
     def training_epoch_end(self, outputs):
         train_loss_mean = torch.stack([x["loss"] for x in outputs]).mean()
+        mlm_loss_mean = torch.stack([x["mlm_loss"] for x in outputs]).mean()
 
         logs = {
             "train_loss": train_loss_mean,
         }
 
         self.log("train_loss", logs["train_loss"])
+        self.log("mlm_loss", mlm_loss_mean)
+
 
     def validation_step(self, batch, batch_idx):
         # training_step defines the train loop. It is independent of forward
@@ -356,19 +355,6 @@ class NERLongformer(pl.LightningModule):
 
     # Freeze weights?
     def configure_optimizers(self):
-        # Freeze alternate layers of longformer
-        for idx, (name, parameters) in enumerate(self.longformer.named_parameters()):
-
-            if idx%2==0:
-                parameters.requires_grad=False
-            else:
-                parameters.requires_grad=True
-
-            # if idx<6:
-            #     parameters.requires_grad=False
-            # else:
-            #     parameters.requires_grad=True
-
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         return optimizer
 
