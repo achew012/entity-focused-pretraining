@@ -2,15 +2,15 @@ from clearml import Task, StorageManager, Dataset as ds
 import argparse, json, os, random, math, ipdb
 
 # Task.add_requirements('transformers', package_version='4.2.0')
-task = Task.init(project_name='ner-pretraining', task_name='EntitySpanPretraining', tags=["maxpool"], output_uri="s3://experiment-logging/storage/")
+task = Task.init(project_name='ner-pretraining', task_name='EntitySpanPretraining', tags=["maxpool", "nofreeze"], output_uri="s3://experiment-logging/storage/")
 clearlogger = task.get_logger()
 
 # config = json.load(open('config.json'))
 
 config={
-    "lr": 5e-4,
-    "num_epochs":5,
-    "train_batch_size":12,
+    "lr": 1e-4,
+    "num_epochs":15,
+    "train_batch_size":4,
     "eval_batch_size":1,
     "max_length": 2048, # be mindful underlength will cause device cuda side error
     "max_span_len": 15,
@@ -211,6 +211,7 @@ class NERLongformer(pl.LightningModule):
         # #self.class_weights[0] = self.class_weights[0]/2
         # self.class_weights = torch.cuda.FloatTensor([0.20, 1, 1.2, 1, 1.2])
         # print("weights: {}".format(self.class_weights))
+
         self.sigmoid = nn.Sigmoid()
         self.classifier = nn.Sequential(
             nn.Linear(self.config.hidden_size*2, self.config.hidden_size),
@@ -265,6 +266,7 @@ class NERLongformer(pl.LightningModule):
         entity_mask = batch.pop("entity_mask", None)
         span_len_mask = batch.pop("span_len_mask", None)
         labels = batch.pop("labels", None)
+        total_loss=0
 
         outputs = self.longformer(
             **batch, 
@@ -296,21 +298,19 @@ class NERLongformer(pl.LightningModule):
 
         ### MLM Objective
         ##############################################################################################################
-        prediction_scores = self.lm_head(outputs[0])
-
+        # prediction_scores = self.lm_head(outputs[0])
         ##############################################################################################################
 
-        total_loss=0
-        
+        masked_lm_loss = None        
         span_clf_loss = None
         if labels!=None:
             loss_fct = nn.BCELoss()
             span_clf_loss = loss_fct(logits.view(-1), labels.view(-1))
             total_loss+=span_clf_loss
 
-        mlm_loss_fct = nn.CrossEntropyLoss()
-        masked_lm_loss = mlm_loss_fct(prediction_scores.view(-1, self.config.vocab_size), batch["input_ids"].view(-1))
-        total_loss+=masked_lm_loss
+        # mlm_loss_fct = nn.CrossEntropyLoss()
+        # masked_lm_loss = mlm_loss_fct(prediction_scores.view(-1, self.config.vocab_size), batch["input_ids"].view(-1))
+        # total_loss+=masked_lm_loss
 
         return (total_loss, logits, span_clf_loss, masked_lm_loss)
 
@@ -356,15 +356,15 @@ class NERLongformer(pl.LightningModule):
     # Freeze weights?
     def configure_optimizers(self):
         # Freeze alternate layers of longformer
-        for idx, (name, parameters) in enumerate(self.longformer.named_parameters()):
-            # if idx%2==0:
+        # for idx, (name, parameters) in enumerate(self.longformer.named_parameters()):
+        #     if idx%2==0:
+        #         parameters.requires_grad=False
+        #     else:
+        #         parameters.requires_grad=True
+            # if idx<6:
             #     parameters.requires_grad=False
             # else:
             #     parameters.requires_grad=True
-            if idx<6:
-                parameters.requires_grad=False
-            else:
-                parameters.requires_grad=True
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         return optimizer
